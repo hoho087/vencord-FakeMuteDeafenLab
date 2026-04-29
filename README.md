@@ -1,4 +1,5 @@
 # FakeMuteDeafenLab
+![image](https://github.com/hoho087/vencord-FakeMuteDeafenLab/blob/main/image.png)
 
 A Vencord user plugin that displays your Discord voice state as muted/deafened while restoring the local RTC media connection.
 
