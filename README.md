@@ -18,7 +18,7 @@ A Vencord user plugin that displays your Discord voice state as muted/deafened w
    src/userplugins/fakeMuteDeafenLab
    ```
 
-2. Restart Discord.
+2. Build Vencord and restart Discord.
 3. Enable **FakeMuteDeafenLab** in Vencord plugins.
 
 ## Usage
@@ -77,7 +77,7 @@ If a Discord update breaks the plugin, the most likely areas to inspect are:
    src/userplugins/fakeMuteDeafenLab
    ```
 
-2. 重新啟動 Discord。
+2. 重新 build Vencord，並重新啟動 Discord。
 3. 在 Vencord plugins 中啟用 **FakeMuteDeafenLab**。
 
 ## 使用方式
