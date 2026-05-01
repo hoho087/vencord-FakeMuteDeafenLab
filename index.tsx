@@ -1,4 +1,4 @@
-﻿/*
+/*
  * FakeMuteDeafenLab
  * Vencord user plugin: display mute/deafen voice states while restoring local RTC media.
  */
@@ -8,7 +8,7 @@ import ErrorBoundary from "@components/ErrorBoundary";
 import { Logger } from "@utils/Logger";
 import definePlugin, { OptionType } from "@utils/types";
 import { findAll, findComponentByCodeLazy } from "@webpack";
-import { Button, FluxDispatcher, Forms, React, UserStore, useStateFromStores, VoiceStateStore } from "@webpack/common";
+import { Button, ContextMenuApi, FluxDispatcher, Forms, Menu, React, UserStore, useStateFromStores, VoiceStateStore } from "@webpack/common";
 
 const logger = new Logger("FakeMuteDeafenLab");
 const PanelButton = findComponentByCodeLazy(".GREEN,positionKeyStemOverride:");
@@ -24,6 +24,7 @@ const settings = definePluginSettings({
         description: "Display yourself as muted while keeping local voice input restored.",
         default: false,
         onChange(value: boolean) {
+            if (suppressFakeSettingOnChange) return;
             void setFakeMute(value, "settings");
         }
     },
@@ -32,6 +33,7 @@ const settings = definePluginSettings({
         description: "Display yourself as deafened while keeping local input/output restored.",
         default: false,
         onChange(value: boolean) {
+            if (suppressFakeSettingOnChange) return;
             void setFakeDeafen(value, "settings");
         }
     },
@@ -60,7 +62,20 @@ let originalRtcConnect: ((...args: any[]) => any) | undefined;
 let originalRtcSetState: ((...args: any[]) => any) | undefined;
 let restoreTimer: ReturnType<typeof setInterval> | undefined;
 let applyTimer: ReturnType<typeof setTimeout> | undefined;
+let restoreBurstTimers: number[] = [];
+let remoteRestoreTimer: ReturnType<typeof setTimeout> | undefined;
 let ensureGeneration = 0;
+let originalFluxDispatch: ((...args: any[]) => any) | undefined;
+let pluginDispatchDepth = 0;
+let pendingDeafTarget: boolean | undefined;
+let pendingDeafUntil = 0;
+let ignoreRemoteIntentUntil = 0;
+let suppressFakeSettingOnChange = false;
+const realVoiceIntent = {
+    initialized: false,
+    selfMute: false,
+    selfDeaf: false
+};
 
 function log(event: string, payload: UnknownRecord = {}) {
     if (!settings.store.debugLogs) return;
@@ -148,6 +163,121 @@ function uninstallRtcTracker() {
     originalRtcSetState = undefined;
 }
 
+function fakeStateActive() {
+    return Boolean(settings.store.fakeMute || settings.store.fakeDeafen);
+}
+
+function updateFakeMuteSetting(enabled: boolean) {
+    if (settings.store.fakeMute === enabled) return;
+    suppressFakeSettingOnChange = true;
+    try {
+        settings.store.fakeMute = enabled;
+    } finally {
+        suppressFakeSettingOnChange = false;
+    }
+}
+
+function updateFakeDeafenSetting(enabled: boolean) {
+    if (settings.store.fakeDeafen === enabled) return;
+    suppressFakeSettingOnChange = true;
+    try {
+        settings.store.fakeDeafen = enabled;
+    } finally {
+        suppressFakeSettingOnChange = false;
+    }
+}
+
+function cancelPendingApplyTimer() {
+    if (applyTimer) clearTimeout(applyTimer);
+    applyTimer = undefined;
+}
+
+function cancelPendingRemoteRestore() {
+    if (remoteRestoreTimer) clearTimeout(remoteRestoreTimer);
+    remoteRestoreTimer = undefined;
+}
+
+function cancelPendingFakeWork() {
+    cancelPendingApplyTimer();
+    cancelPendingRemoteRestore();
+    clearRestoreBurst();
+    pendingDeafTarget = undefined;
+    pendingDeafUntil = 0;
+    ensureGeneration++;
+}
+
+
+function captureRealVoiceIntent(reason: string, remote = currentRemoteState()) {
+    realVoiceIntent.initialized = true;
+    realVoiceIntent.selfDeaf = Boolean(remote.selfDeaf);
+    realVoiceIntent.selfMute = Boolean(remote.selfMute || remote.selfDeaf);
+    log("real_voice_intent_captured", { reason, realVoiceIntent: { ...realVoiceIntent }, remote });
+}
+
+function maybeCaptureRealVoiceIntentFromRemote(reason: string, remote = currentRemoteState()) {
+    if (fakeStateActive() || Date.now() < ignoreRemoteIntentUntil) return;
+    captureRealVoiceIntent(reason, remote);
+}
+
+function ensureRealVoiceIntent(reason: string) {
+    if (!realVoiceIntent.initialized) captureRealVoiceIntent(reason);
+}
+
+function observeExternalAudioAction(action: any) {
+    if (!action?.type) return;
+
+    ensureRealVoiceIntent(`external action ${action.type}`);
+
+    if (action.type === "AUDIO_SET_SELF_MUTE") {
+        const nextMute = action.mute ?? action.muted ?? action.selfMute;
+        if (nextMute != null) realVoiceIntent.selfMute = Boolean(nextMute);
+    } else if (action.type === "AUDIO_TOGGLE_SELF_MUTE") {
+        realVoiceIntent.selfMute = !currentRemoteState().selfMute;
+    } else if (action.type === "AUDIO_SET_SELF_DEAF") {
+        const nextDeaf = action.deaf ?? action.deafened ?? action.selfDeaf;
+        if (nextDeaf != null) realVoiceIntent.selfDeaf = Boolean(nextDeaf);
+    } else if (action.type === "AUDIO_TOGGLE_SELF_DEAF") {
+        realVoiceIntent.selfDeaf = !currentRemoteState().selfDeaf;
+    } else {
+        return;
+    }
+
+    if (realVoiceIntent.selfDeaf) realVoiceIntent.selfMute = true;
+    log("real_voice_intent_updated", { type: action.type, action, realVoiceIntent: { ...realVoiceIntent } });
+}
+
+function installFluxDispatchObserver() {
+    if (originalFluxDispatch) return;
+
+    originalFluxDispatch = FluxDispatcher.dispatch;
+    FluxDispatcher.dispatch = function (this: any, ...args: any[]) {
+        if (!pluginDispatchDepth) {
+            try { observeExternalAudioAction(args[0]); } catch (err) { log("observe_external_audio_action_failed", { error: String(err) }); }
+        }
+
+        return originalFluxDispatch!.apply(this, args);
+    } as any;
+
+    log("flux_dispatch_observer_installed");
+}
+
+function uninstallFluxDispatchObserver() {
+    if (!originalFluxDispatch) return;
+
+    try { FluxDispatcher.dispatch = originalFluxDispatch as any; } catch { }
+    originalFluxDispatch = undefined;
+}
+
+function dispatchPluginAction(action: any) {
+    pluginDispatchDepth++;
+    ignoreRemoteIntentUntil = Date.now() + 2500;
+    try {
+        return FluxDispatcher.dispatch(action);
+    } finally {
+        pluginDispatchDepth--;
+    }
+}
+
 function getMediaConnection() {
     return lastRtcConnectionInstance?._connection;
 }
@@ -224,13 +354,41 @@ function forceLocalMedia(options: { muted?: boolean; deafened?: boolean; } = {})
     return Object.values(attempts).some((list: any) => Array.isArray(list) && list.some(a => a.ok));
 }
 
-function restoreLocalMediaSoon() {
-    if (!settings.store.fakeMute && !settings.store.fakeDeafen) return;
+function fakeRestoreOptions() {
+    return {
+        muted: settings.store.fakeMute || settings.store.fakeDeafen ? false : undefined,
+        deafened: settings.store.fakeDeafen ? false : undefined
+    };
+}
 
+function clearRestoreBurst() {
+    for (const timer of restoreBurstTimers) window.clearTimeout(timer);
+    restoreBurstTimers = [];
+}
+
+function restoreLocalMediaSoon(reason = "restore") {
+    if (!fakeStateActive()) return;
+
+    clearRestoreBurst();
+    const delay = Math.max(0, Number(settings.store.restoreDelayMs) || 0);
+    const delays = [0, delay, delay + 250, delay + 700, delay + 1300, delay + 2200];
+
+    for (const wait of delays) {
+        restoreBurstTimers.push(window.setTimeout(() => {
+            forceLocalMedia(fakeRestoreOptions());
+        }, wait));
+    }
+
+    log("restore_local_media_burst_scheduled", { reason, delays, options: fakeRestoreOptions() });
+}
+
+function syncLocalToRealIntentSoon(reason = "sync-real") {
+    ensureRealVoiceIntent(reason);
     window.setTimeout(() => {
+        if (fakeStateActive()) return;
         forceLocalMedia({
-            muted: false,
-            deafened: settings.store.fakeDeafen ? false : undefined
+            muted: Boolean(realVoiceIntent.selfMute || realVoiceIntent.selfDeaf),
+            deafened: Boolean(realVoiceIntent.selfDeaf)
         });
     }, Math.max(0, Number(settings.store.restoreDelayMs) || 0));
 }
@@ -239,14 +397,14 @@ function scheduleApplyConfiguredState(reason: string, delay = 300) {
     if (applyTimer) clearTimeout(applyTimer);
     applyTimer = setTimeout(() => {
         applyTimer = undefined;
-        log("scheduled_apply", { reason, remote: currentRemoteState(), media: inspectMediaConnection() });
+        log("scheduled_local_restore", { reason, remote: currentRemoteState(), media: inspectMediaConnection() });
         ensureConfiguredState(reason);
     }, delay);
 }
 
 // 透過 Discord 原有 Flux action 更新對外可見的 mute / deafen 狀態。
 function dispatchRemoteMute(mute: boolean) {
-    FluxDispatcher.dispatch({
+    dispatchPluginAction({
         type: "AUDIO_SET_SELF_MUTE",
         context: "default",
         mute,
@@ -254,31 +412,61 @@ function dispatchRemoteMute(mute: boolean) {
     } as any);
 }
 
-function toggleRemoteDeaf() {
-    FluxDispatcher.dispatch({
-        type: "AUDIO_TOGGLE_SELF_DEAF",
+function dispatchRemoteDeaf(deafened: boolean) {
+    pendingDeafTarget = deafened;
+    pendingDeafUntil = Date.now() + 1800;
+
+    dispatchPluginAction({
+        type: "AUDIO_SET_SELF_DEAF",
         context: "default",
-        syncRemote: true
+        deaf: deafened,
+        deafened,
+        syncRemote: true,
+        playSoundEffect: true
     } as any);
 }
 
 async function setFakeMute(enabled: boolean, source = "ui") {
-    settings.store.fakeMute = enabled;
-    log("set_fake_mute", { enabled, source, before: inspectMediaConnection() });
-    ensureConfiguredState(`setFakeMute:${source}`);
+    const wasFakeActive = fakeStateActive();
+    if (enabled && !wasFakeActive) ensureRealVoiceIntent(`enable fake mute:${source}`);
+
+    cancelPendingFakeWork();
+    updateFakeMuteSetting(enabled);
+
+    const isFakeActive = fakeStateActive();
+    log("set_fake_mute", { enabled, source, wasFakeActive, isFakeActive, realVoiceIntent: { ...realVoiceIntent }, before: inspectMediaConnection() });
+
+    if (isFakeActive) {
+        restoreLocalMediaSoon(`setFakeMute:${source}`);
+    } else {
+        syncLocalToRealIntentSoon(`disable fake mute:${source}`);
+    }
 }
 
 async function setFakeDeafen(enabled: boolean, source = "ui") {
-    settings.store.fakeDeafen = enabled;
-    log("set_fake_deafen", { enabled, source, before: inspectMediaConnection() });
-    ensureConfiguredState(`setFakeDeafen:${source}`);
+    const wasFakeActive = fakeStateActive();
+    if (enabled && !wasFakeActive) ensureRealVoiceIntent(`enable fake deafen:${source}`);
+
+    cancelPendingFakeWork();
+    updateFakeDeafenSetting(enabled);
+
+    const isFakeActive = fakeStateActive();
+    log("set_fake_deafen", { enabled, source, wasFakeActive, isFakeActive, realVoiceIntent: { ...realVoiceIntent }, before: inspectMediaConnection() });
+
+    if (isFakeActive) {
+        restoreLocalMediaSoon(`setFakeDeafen:${source}`);
+    } else {
+        syncLocalToRealIntentSoon(`disable fake deafen:${source}`);
+    }
 }
 
 // Fake Deafen 在 Discord UI 中通常也會帶有 selfMute，所以 desired state 在這裡統一計算。
 function desiredRemoteState() {
+    ensureRealVoiceIntent("desired remote state");
+
     return {
-        selfDeaf: Boolean(settings.store.fakeDeafen),
-        selfMute: Boolean(settings.store.fakeMute || settings.store.fakeDeafen)
+        selfDeaf: Boolean(realVoiceIntent.selfDeaf || settings.store.fakeDeafen),
+        selfMute: Boolean(realVoiceIntent.selfMute || realVoiceIntent.selfDeaf || settings.store.fakeMute || settings.store.fakeDeafen)
     };
 }
 
@@ -287,7 +475,45 @@ function remoteMatchesDesired(remote = currentRemoteState()) {
     return remote.selfDeaf === desired.selfDeaf && remote.selfMute === desired.selfMute;
 }
 
+function realRemoteState() {
+    ensureRealVoiceIntent("real remote state");
+    return {
+        selfDeaf: Boolean(realVoiceIntent.selfDeaf),
+        selfMute: Boolean(realVoiceIntent.selfMute || realVoiceIntent.selfDeaf)
+    };
+}
+
+function applyRemoteTargetOnce(target: { selfMute: boolean; selfDeaf: boolean; }, reason: string) {
+    const remote = currentRemoteState();
+    if (!remote.channelId) return;
+
+    log("apply_remote_target_once", { reason, target, remote });
+
+    if (remote.selfDeaf !== target.selfDeaf) dispatchRemoteDeaf(target.selfDeaf);
+
+    // Changing deaf can implicitly affect mute inside Discord, so set mute once shortly after.
+    if (remote.selfMute !== target.selfMute || remote.selfDeaf !== target.selfDeaf) {
+        cancelPendingRemoteRestore();
+        remoteRestoreTimer = setTimeout(() => {
+            remoteRestoreTimer = undefined;
+            if (fakeStateActive()) return;
+
+            const nextRemote = currentRemoteState();
+            if (nextRemote.channelId && nextRemote.selfMute !== target.selfMute)
+                dispatchRemoteMute(target.selfMute);
+        }, remote.selfDeaf !== target.selfDeaf ? 450 : 0);
+    }
+}
+
+function restoreRemoteToRealIntent(reason = "restore-real") {
+    if (fakeStateActive()) return;
+    applyRemoteTargetOnce(realRemoteState(), reason);
+}
+
+
 // 主要狀態機：先對齊可見狀態，再恢復本地 media；重連或切換頻道時會自動重試。
+// Local-only state machine: fake toggles never press Discord's native mute/deafen for you.
+// They only keep local RTC input/output restored while you choose the visible Discord state yourself.
 function ensureConfiguredState(reason = "ensure", attempt = 0, generation = ++ensureGeneration) {
     const remote = currentRemoteState();
     if (!remote.channelId) {
@@ -295,33 +521,20 @@ function ensureConfiguredState(reason = "ensure", attempt = 0, generation = ++en
         return;
     }
 
-    const desired = desiredRemoteState();
-
-    log("ensure_configured_state", { reason, attempt, desired, remote, media: inspectMediaConnection() });
-
-    if (remote.selfDeaf !== desired.selfDeaf) {
-        toggleRemoteDeaf();
-        restoreLocalMediaSoon();
-    } else if (remote.selfMute !== desired.selfMute) {
-        dispatchRemoteMute(desired.selfMute);
-        restoreLocalMediaSoon();
-    } else if (desired.selfMute || desired.selfDeaf) {
-        restoreLocalMediaSoon();
+    if (!fakeStateActive()) {
+        log("apply_skipped", { reason: "fake disabled", trigger: reason, remote, realVoiceIntent: { ...realVoiceIntent } });
+        return;
     }
 
-    if (attempt >= 8) return;
+    log("ensure_local_restore_state", { reason, attempt, remote, realVoiceIntent: { ...realVoiceIntent }, media: inspectMediaConnection() });
+    restoreLocalMediaSoon(reason);
+
+    if (attempt >= 2 || !fakeStateActive()) return;
 
     window.setTimeout(() => {
-        if (generation !== ensureGeneration) return;
-
-        const nextRemote = currentRemoteState();
-        if (!remoteMatchesDesired(nextRemote)) {
-            ensureConfiguredState(`${reason}:retry`, attempt + 1, generation);
-            return;
-        }
-
-        if (desired.selfMute || desired.selfDeaf) restoreLocalMediaSoon();
-    }, Math.max(650, Number(settings.store.restoreDelayMs) + 300));
+        if (generation !== ensureGeneration || !fakeStateActive()) return;
+        restoreLocalMediaSoon(`${reason}:retry-local`);
+    }, Math.max(900, Number(settings.store.restoreDelayMs) + 500));
 }
 
 function startRestoreTimer() {
@@ -330,18 +543,16 @@ function startRestoreTimer() {
         if (!settings.store.autoRestoreLocalMedia) return;
         if (!settings.store.fakeMute && !settings.store.fakeDeafen) return;
 
-        forceLocalMedia({
-            muted: false,
-            deafened: settings.store.fakeDeafen ? false : undefined
-        });
+        forceLocalMedia(fakeRestoreOptions());
     }, 1500);
 }
 
 function stopRestoreTimer() {
     if (restoreTimer) clearInterval(restoreTimer);
     restoreTimer = undefined;
-    if (applyTimer) clearTimeout(applyTimer);
-    applyTimer = undefined;
+    cancelPendingApplyTimer();
+    cancelPendingRemoteRestore();
+    clearRestoreBurst();
 }
 
 function StatusPanel() {
@@ -403,44 +614,60 @@ function FakeDeafenIcon() {
     );
 }
 
-// Discord 左下角帳號區的快捷按鈕；只在目前已加入語音時顯示。
+function FakeMuteDeafenCombinedIcon() {
+    const { fakeDeafen } = settings.use(["fakeDeafen"]);
+    return fakeDeafen ? <FakeDeafenIcon /> : <FakeMuteIcon />;
+}
+
+function FakeMuteDeafenContextMenu() {
+    const { fakeMute, fakeDeafen } = settings.use(["fakeMute", "fakeDeafen"]);
+
+    return <Menu.Menu
+        navId="fake-mute-deafen-lab-menu"
+        onClose={ContextMenuApi.closeContextMenu}
+        aria-label="Fake Mute/Deafen"
+    >
+        <Menu.MenuCheckboxItem
+            id="fake-mute-deafen-lab-mute"
+            label="Fake Mute"
+            checked={fakeMute}
+            action={() => void setFakeMute(!fakeMute, "panel-menu")}
+        />
+        <Menu.MenuCheckboxItem
+            id="fake-mute-deafen-lab-deafen"
+            label="Fake Deafen"
+            checked={fakeDeafen}
+            action={() => void setFakeDeafen(!fakeDeafen, "panel-menu")}
+        />
+    </Menu.Menu>;
+}
+
+// Adaptive account-area entry: one native PanelButton, no fixed pixel offsets.
 function FakeMuteDeafenPanelButtons(props: { nameplate?: any; }) {
-    const { showPanelButtons } = settings.use(["showPanelButtons"]);
+    const { showPanelButtons, fakeMute, fakeDeafen } = settings.use(["showPanelButtons", "fakeMute", "fakeDeafen"]);
     const remote = useStateFromStores([VoiceStateStore], currentRemoteState);
-    const [tick, setTick] = React.useState(0);
-    void tick;
 
     if (!showPanelButtons || !remote.channelId) return null;
 
-    const refresh = () => setTick(t => t + 1);
+    const active = fakeMute || fakeDeafen;
+    const tooltipText = active
+        ? `Fake: ${fakeMute ? "Mute" : ""}${fakeMute && fakeDeafen ? " + " : ""}${fakeDeafen ? "Deafen" : ""}`
+        : "Fake Mute/Deafen";
 
-    return <>
-        <PanelButton
-            tooltipText={settings.store.fakeMute ? "Disable Fake Mute" : "Enable Fake Mute"}
-            icon={FakeMuteIcon}
-            role="switch"
-            aria-checked={settings.store.fakeMute}
-            redGlow={settings.store.fakeMute}
-            plated={props?.nameplate != null}
-            onClick={() => {
-                void setFakeMute(!settings.store.fakeMute, "panel-button").then(refresh);
-            }}
-        />
-        <PanelButton
-            tooltipText={settings.store.fakeDeafen ? "Disable Fake Deafen" : "Enable Fake Deafen"}
-            icon={FakeDeafenIcon}
-            role="switch"
-            aria-checked={settings.store.fakeDeafen}
-            redGlow={settings.store.fakeDeafen}
-            plated={props?.nameplate != null}
-            onClick={() => {
-                void setFakeDeafen(!settings.store.fakeDeafen, "panel-button").then(refresh);
-            }}
-        />
-    </>;
+    return <PanelButton
+        tooltipText={tooltipText}
+        icon={FakeMuteDeafenCombinedIcon}
+        role="button"
+        aria-checked={active}
+        redGlow={active}
+        plated={props?.nameplate != null}
+        onClick={(event: React.MouseEvent) => {
+            ContextMenuApi.openContextMenu(event, () => <FakeMuteDeafenContextMenu />);
+        }}
+    />;
 }
 
-// 暴露少量 DevTools helper，方便 Discord 更新後快速確認狀態。
+// DevTools helpers for checking state after Discord updates.
 function exposeHelpers() {
     const g = globalThis as typeof globalThis & {
         FakeMuteDeafenLabStatus?: () => unknown;
@@ -483,6 +710,8 @@ export default definePlugin({
 
     start() {
         installRtcTracker();
+        installFluxDispatchObserver();
+        ensureRealVoiceIntent("startup");
         exposeHelpers();
         startRestoreTimer();
         window.setTimeout(() => ensureConfiguredState("startup"), 1500);
@@ -491,6 +720,7 @@ export default definePlugin({
     stop() {
         stopRestoreTimer();
         removeHelpers();
+        uninstallFluxDispatchObserver();
         uninstallRtcTracker();
     },
 
@@ -500,8 +730,15 @@ export default definePlugin({
         VOICE_STATE_UPDATES({ voiceStates }: { voiceStates: Array<{ userId?: string; channelId?: string | null; selfMute?: boolean; selfDeaf?: boolean; }>; }) {
             const currentUserId = UserStore.getCurrentUser?.()?.id;
             if (!currentUserId) return;
-            if (!voiceStates?.some(state => state?.userId === currentUserId)) return;
+            const ownState = voiceStates?.find(state => state?.userId === currentUserId);
+            if (!ownState) return;
 
+            maybeCaptureRealVoiceIntentFromRemote("own VOICE_STATE_UPDATES", {
+                selfMute: Boolean(ownState.selfMute),
+                selfDeaf: Boolean(ownState.selfDeaf),
+                channelId: ownState.channelId,
+                sessionIdPresent: true
+            });
             scheduleApplyConfiguredState("own VOICE_STATE_UPDATES");
         },
 
