@@ -361,25 +361,93 @@ function fakeRestoreOptions() {
     };
 }
 
+function localMediaNeedsRestore() {
+    if (!fakeStateActive()) return false;
+
+    const connection = getMediaConnection();
+    if (!connection) {
+        log("local_media_self_check", { ok: false, reason: "RTC media connection unavailable", remote: currentRemoteState() });
+        return true;
+    }
+
+    let selfMute: unknown;
+    let selfDeaf: unknown;
+
+    try { selfMute = connection.getSelfMute?.(); } catch (err) { selfMute = `error:${String(err)}`; }
+    try { selfDeaf = connection.getSelfDeaf?.(); } catch (err) { selfDeaf = `error:${String(err)}`; }
+
+    const muteNeedsRestore = (settings.store.fakeMute || settings.store.fakeDeafen) && selfMute === true;
+    const deafNeedsRestore = settings.store.fakeDeafen && selfDeaf === true;
+
+    // If Discord renamed/removed getters, keep doing a light direct restore instead of trusting an unknown state.
+    const unknownState = ((settings.store.fakeMute || settings.store.fakeDeafen) && selfMute == null)
+        || (settings.store.fakeDeafen && selfDeaf == null);
+
+    const needsRestore = Boolean(muteNeedsRestore || deafNeedsRestore || unknownState);
+    log("local_media_self_check", {
+        ok: !needsRestore,
+        needsRestore,
+        selfMute,
+        selfDeaf,
+        fakeMute: settings.store.fakeMute,
+        fakeDeafen: settings.store.fakeDeafen,
+        unknownState
+    });
+
+    return needsRestore;
+}
+
+function selfCheckLocalMedia(reason = "self-check") {
+    if (!settings.store.autoRestoreLocalMedia || !fakeStateActive()) return;
+
+    if (!localMediaNeedsRestore()) return;
+
+    if (!forceLocalMedia(fakeRestoreOptions())) restoreLocalMediaSoon(`${reason}:fallback`);
+}
+
 function clearRestoreBurst() {
     for (const timer of restoreBurstTimers) window.clearTimeout(timer);
     restoreBurstTimers = [];
 }
 
+function forgetRestoreBurstTimer(timer: number) {
+    restoreBurstTimers = restoreBurstTimers.filter(activeTimer => activeTimer !== timer);
+}
+
+function trimRestoreBurstTimers(maxTimers = 64) {
+    if (restoreBurstTimers.length <= maxTimers) return;
+
+    const removeCount = restoreBurstTimers.length - maxTimers;
+    const staleTimers = restoreBurstTimers.splice(0, removeCount);
+    for (const timer of staleTimers) window.clearTimeout(timer);
+}
+
+function scheduleRestoreAttempt(wait: number) {
+    let timer = 0;
+    timer = window.setTimeout(() => {
+        forgetRestoreBurstTimer(timer);
+        if (!fakeStateActive()) return;
+        forceLocalMedia(fakeRestoreOptions());
+    }, wait);
+
+    restoreBurstTimers.push(timer);
+}
+
 function restoreLocalMediaSoon(reason = "restore") {
     if (!fakeStateActive()) return;
 
-    clearRestoreBurst();
     const delay = Math.max(0, Number(settings.store.restoreDelayMs) || 0);
-    const delays = [0, delay, delay + 250, delay + 700, delay + 1300, delay + 2200];
+    const delays = [0, delay, delay + 250, delay + 700, delay + 1300, delay + 2200, delay + 3500, delay + 5000];
 
-    for (const wait of delays) {
-        restoreBurstTimers.push(window.setTimeout(() => {
-            forceLocalMedia(fakeRestoreOptions());
-        }, wait));
-    }
+    for (const wait of delays) scheduleRestoreAttempt(wait);
+    trimRestoreBurstTimers();
 
-    log("restore_local_media_burst_scheduled", { reason, delays, options: fakeRestoreOptions() });
+    log("restore_local_media_burst_scheduled", {
+        reason,
+        delays,
+        queuedTimers: restoreBurstTimers.length,
+        options: fakeRestoreOptions()
+    });
 }
 
 function syncLocalToRealIntentSoon(reason = "sync-real") {
@@ -539,12 +607,7 @@ function ensureConfiguredState(reason = "ensure", attempt = 0, generation = ++en
 
 function startRestoreTimer() {
     stopRestoreTimer();
-    restoreTimer = setInterval(() => {
-        if (!settings.store.autoRestoreLocalMedia) return;
-        if (!settings.store.fakeMute && !settings.store.fakeDeafen) return;
-
-        forceLocalMedia(fakeRestoreOptions());
-    }, 1500);
+    restoreTimer = setInterval(() => selfCheckLocalMedia("periodic self-check"), 2500);
 }
 
 function stopRestoreTimer() {
